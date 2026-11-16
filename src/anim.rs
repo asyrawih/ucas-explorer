@@ -31,6 +31,119 @@ impl Anim {
     }
 }
 
+/// A SkeletalMesh package that references package `target` (a Skeleton or PhysicsAsset, "/Game/X/Y"):
+/// (parsed package, export, container path). `hint`: container path substring to pick instead.
+// Search order: the target's folder, its parent and grandparent (SK_* first); then every package in the
+// archive whose name shares the most name tokens with the target ("ABP_Headwear_Rabbit_Skeleton" ->
+// "SK_Headwear_Rabbit"). Each candidate is verified by its imports. Results are cached in the Resolver.
+// ponytail: capped at 300 loads per tier; a mesh sharing no name token and living elsewhere needs the hint.
+pub fn find_skeletal_mesh(
+    res: &crate::global::Resolver,
+    target: &str,
+    hint: Option<&str>,
+    load: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> Option<(crate::zen::ZenPackage, usize, String)> {
+    let key = target.to_lowercase();
+    let cached = if hint.is_none() { res.skeletal_users.lock().ok().and_then(|c| c.get(&key).cloned()) } else { None };
+    let found = match cached {
+        Some(None) => return None,
+        Some(Some(path)) => {
+            let p = load(&path).and_then(|d| crate::zen::parse(d).ok())?;
+            let i = (0..p.exports.len()).find(|&i| res.class_name(&p, i) == "SkeletalMesh")?;
+            Some((p, i, path))
+        }
+        None => search_skeletal_mesh(res, target, hint, load),
+    };
+    if hint.is_none() {
+        if let Ok(mut c) = res.skeletal_users.lock() {
+            c.insert(key, found.as_ref().map(|f| f.2.clone()));
+        }
+    }
+    found
+}
+
+/// Name tokens for matching: lowercase, split on '_', without asset-type prefixes/suffixes and short noise.
+fn name_tokens(name: &str) -> Vec<String> {
+    const NOISE: &[&str] = &["sk", "skel", "skeleton", "abp", "physicsasset", "physics", "phys", "pa", "mesh", "rig", "anim", "bp", "vanity", "c"];
+    name.to_lowercase().split(['_', '-', ' ']).filter(|t| t.len() > 1 && !NOISE.contains(t)).map(String::from).collect()
+}
+
+fn search_skeletal_mesh(
+    res: &crate::global::Resolver,
+    target: &str,
+    hint: Option<&str>,
+    load: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> Option<(crate::zen::ZenPackage, usize, String)> {
+    let path = res.packages.get(&crate::global::package_id(target))?.clone();
+    let mut dirs = vec![path.rsplit_once('/').map_or("", |(d, _)| d).to_string()];
+    for _ in 0..2 {
+        let up = dirs.last().unwrap().rsplit_once('/').map_or("", |(d, _)| d).to_string();
+        if up.is_empty() || up.ends_with("/Content") {
+            break;
+        }
+        dirs.push(up);
+    }
+    let mut cands: Vec<&String> = match hint {
+        Some(h) => res.packages.values().filter(|p| p.to_lowercase().contains(&h.to_lowercase())).collect(),
+        None => {
+            let mut c: Vec<&String> = vec![];
+            for d in &dirs {
+                let mut level: Vec<&String> = res.packages.values().filter(|p| p.starts_with(&format!("{d}/")) && !c.contains(p)).collect();
+                let sk = |p: &&String| !p.rsplit('/').next().unwrap_or("").to_lowercase().starts_with("sk_");
+                level.sort_by(|a, b| (sk(a), a.len(), *a).cmp(&(sk(b), b.len(), *b)));
+                c.extend(level);
+            }
+            c
+        }
+    };
+    cands.retain(|p| p.ends_with(".uasset"));
+    let mut check = |path: &String| -> Option<(crate::zen::ZenPackage, usize, String)> {
+        let p = load(path).and_then(|d| crate::zen::parse(d).ok())?;
+        if hint.is_none() && !p.imported_package_names.iter().any(|n| n.eq_ignore_ascii_case(target)) {
+            return None;
+        }
+        let i = (0..p.exports.len()).find(|&i| res.class_name(&p, i) == "SkeletalMesh")?;
+        Some((p, i, path.clone()))
+    };
+    let mut tried: std::collections::HashSet<&String> = std::collections::HashSet::new();
+    for path in cands.into_iter().take(300) {
+        tried.insert(path);
+        if let Some(f) = check(path) {
+            return Some(f);
+        }
+    }
+    if hint.is_some() {
+        return None;
+    }
+    // tier 2: archive-wide, by shared name tokens
+    let want = name_tokens(target.rsplit('/').next().unwrap_or(target));
+    if want.is_empty() {
+        return None;
+    }
+    let mut scored: Vec<(usize, bool, &String)> = res
+        .packages
+        .values()
+        .filter(|p| p.ends_with(".uasset") && !tried.contains(p))
+        .filter_map(|p| {
+            let file = p.rsplit('/').next().unwrap_or(p).trim_end_matches(".uasset");
+            let have = name_tokens(file);
+            let n = want.iter().filter(|t| have.contains(t)).count();
+            (n > 0).then(|| (n, !file.to_lowercase().starts_with("sk_"), p))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2)));
+    scored.into_iter().take(300).find_map(|(_, _, p)| check(p))
+}
+
+/// The Skeleton package an animation asset / AnimBlueprint uses: the imported package holding a Skeleton.
+pub fn skeleton_of(res: &crate::global::Resolver, pkg: &crate::zen::ZenPackage, load: &mut dyn FnMut(&str) -> Option<Vec<u8>>) -> Option<String> {
+    pkg.imported_package_names.iter().filter(|n| !n.starts_with("/Script/")).find_map(|n| {
+        let path = res.packages.get(&crate::global::package_id(n))?;
+        let p = crate::zen::parse(load(path)?).ok()?;
+        (0..p.exports.len()).any(|i| res.class_name(&p, i) == "Skeleton").then(|| n.clone())
+    })
+}
+
 /// AnimSequence export -> .glb with skeleton + animation, plus a skinned mesh when one is found: the package
 /// matching `mesh_hint` (container path substring), else a SkeletalMesh next to the Skeleton that imports it.
 /// Returns (glb, mesh container path used).
@@ -57,36 +170,13 @@ pub fn anim_to_glb(
         })
         .ok_or("anim: Skeleton import not found or undecodable")?;
 
-    // ponytail: mesh auto-pick scans packages in the Skeleton's folder (then its parent), capped at 200 loads;
-    // meshes elsewhere need `mesh_hint`.
-    let skel_path = container(&skel_pkg).unwrap_or_default();
-    let dir = skel_path.rsplit_once('/').map_or("", |(d, _)| d).to_string();
-    let parent = dir.rsplit_once('/').map_or("", |(d, _)| d).to_string();
-    let mut cands: Vec<&String> = match mesh_hint {
-        Some(h) => res.packages.values().filter(|p| p.to_lowercase().contains(&h.to_lowercase())).collect(),
-        None => {
-            let mut c: Vec<_> = res.packages.values().filter(|p| p.rsplit_once('/').is_some_and(|(d, _)| d == dir)).collect();
-            c.sort();
-            let mut up: Vec<_> = res.packages.values().filter(|p| !parent.is_empty() && p.starts_with(&format!("{parent}/")) && !c.contains(p)).collect();
-            up.sort();
-            c.extend(up);
-            c
-        }
-    };
-    cands.retain(|p| p.ends_with(".uasset"));
     let mut mesh = None;
-    for path in cands.into_iter().take(200) {
-        let Some(p) = parse(load, path) else { continue };
-        if mesh_hint.is_none() && !p.imported_package_names.contains(&skel_pkg) {
-            continue;
-        }
-        let Some(i) = (0..p.exports.len()).find(|&i| res.class_name(&p, i) == "SkeletalMesh") else { continue };
+    if let Some((p, i, path)) = find_skeletal_mesh(res, &skel_pkg, mesh_hint, load) {
         let ubulk = load(&format!("{}.ubulk", path.trim_end_matches(".uasset")));
         if let Ok(m) = skeletal::decode_skeletal_mesh(&p, i, ubulk.as_deref()) {
             let need = m.sections.iter().map(|s| s.0 as usize + 1).max().unwrap_or(1);
             let tex = crate::material::slot_diffuse_pngs(res, &p, i, need, load);
-            mesh = Some((m, tex, path.clone()));
-            break;
+            mesh = Some((m, tex, path));
         }
     }
     let (m, tex, used) = match mesh {
@@ -814,5 +904,33 @@ mod tests {
             }
         }
         eprintln!("decoded {ok}/{} (with mesh: {with_mesh}) {errs:#?}", seen.min(limit));
+    }
+}
+
+#[cfg(test)]
+mod coverage {
+    /// How many Skeletons / PhysicsAssets find a SkeletalMesh: `UCAS_TEST_PAK=x.pak cargo test skeletal_mesh_coverage -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn skeletal_mesh_coverage() {
+        let pak = std::path::PathBuf::from(std::env::var("UCAS_TEST_PAK").unwrap());
+        let toc = crate::open_archive(&pak).unwrap();
+        let res = crate::global::Resolver::load(&pak.with_file_name("global.utoc"), &toc).unwrap();
+        let mut f = std::fs::File::open(&pak).unwrap();
+        let targets: Vec<String> = toc.files.iter().map(|(p, _)| p.clone()).filter(|p| p.ends_with("_Skeleton.uasset") || p.ends_with("_PhysicsAsset.uasset")).collect();
+        let mut load = |q: &str| -> Option<Vec<u8>> {
+            let k = toc.files.binary_search_by(|(p, _)| p.as_str().cmp(q)).ok()?;
+            crate::read_chunk(&toc, &mut f, toc.files[k].1, u64::MAX).ok()
+        };
+        let t = std::time::Instant::now();
+        let (mut found, mut missing) = (0, vec![]);
+        for p in &targets {
+            let pkg = crate::global::container_path_to_package(p).unwrap();
+            match super::find_skeletal_mesh(&res, &pkg, None, &mut load) {
+                Some(_) => found += 1,
+                None => missing.push(pkg),
+            }
+        }
+        println!("{found}/{} found in {:?}; missing e.g. {:?}", targets.len(), t.elapsed(), &missing[..missing.len().min(8)]);
     }
 }

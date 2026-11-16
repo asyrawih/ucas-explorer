@@ -29,6 +29,8 @@ pub struct ZenPackage {
     pub imports: Vec<ObjIndex>,               // import map
     pub exports: Vec<ZenExport>,
     pub data: Vec<u8>,
+    /// legacy (.uasset+.uexp) packages only: full object path per import index (see legacy.rs)
+    pub import_paths: Vec<String>,
 }
 
 impl ZenPackage {
@@ -89,6 +91,9 @@ fn mapped_name(names: &[String], idx: u32, num: u32) -> Res<String> {
 /// after ImportedPackageNamesOffset), name batch follows. Export data starts at HeaderSize and
 /// FExportMapEntry::CookedSerialOffset is relative to that.
 pub fn parse(data: Vec<u8>) -> Res<ZenPackage> {
+    if crate::legacy::is_legacy(&data) {
+        return crate::legacy::parse(data);
+    }
     let mut c = Cur(&data, 0);
     if c.u32()? != 0 {
         return Err("zen: versioned packages (bHasVersioningInfo) not supported".into());
@@ -153,7 +158,7 @@ pub fn parse(data: Vec<u8>) -> Res<ZenPackage> {
             data_size: size,
         });
     }
-    Ok(ZenPackage { name, flags, names, imported_packages, imported_package_names, imported_public_export_hashes, imports, exports, data })
+    Ok(ZenPackage { name, flags, names, imported_packages, imported_package_names, imported_public_export_hashes, imports, exports, data, import_paths: vec![] })
 }
 
 #[cfg(test)]

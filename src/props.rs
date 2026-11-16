@@ -1,5 +1,6 @@
 //! .usmap mappings + unversioned property deserialization (reference: CUE4Parse UsmapParser,
-//! FUnversionedHeader/FIterator, *Property.cs, FScriptStruct).
+//! FUnversionedHeader/FIterator, *Property.cs, FScriptStruct), and tagged (FPropertyTag) properties
+//! of legacy UE4 packages, which need no mappings.
 use crate::global::Resolver;
 use crate::zen::ZenPackage;
 use crate::Res;
@@ -383,6 +384,11 @@ impl Ctx<'_> {
 
     /// FSoftObjectPath (UE5.1+, no soft path list in cooked zen): FTopLevelAssetPath + FString subpath.
     fn soft(&self, r: &mut Rd) -> Res<String> {
+        if self.ue4() {
+            // UE4 FSoftObjectPath: FName AssetPathName ("/Game/X.Y") + FString SubPathString
+            let (path, sub) = (self.name(r)?, r.fstring()?);
+            return Ok(if sub.is_empty() || path == "None" { path } else { format!("{path}:{sub}") });
+        }
         let (pkg, asset, sub) = (self.name(r)?, self.name(r)?, r.fstring()?);
         Ok(match (pkg.as_str(), asset.as_str(), sub.as_str()) {
             ("None", _, _) => "None".into(),
@@ -553,6 +559,153 @@ impl Ctx<'_> {
         })
     }
 
+    /// Legacy UE4 package (tagged properties, float math structs).
+    fn ue4(&self) -> bool {
+        !self.pkg.import_paths.is_empty()
+    }
+
+    /// Tagged property list (FPropertyTag ... "None"). Every value is re-synced to its tag's size, so
+    /// an unreadable value becomes an "<error: ...>" string instead of derailing the rest.
+    fn tagged(&self, r: &mut Rd, depth: u32) -> Res<Vec<(String, Value)>> {
+        if depth > 32 {
+            return Err("structs nested too deep".into());
+        }
+        let mut out = vec![];
+        loop {
+            let name = self.name(r)?;
+            if name == "None" {
+                return Ok(out);
+            }
+            let ty = self.name(r)?;
+            let (size, idx) = (r.i32()?, r.i32()?);
+            let size = usize::try_from(size).map_err(|_| format!("{name}: negative property size"))?;
+            let tag = match ty.as_str() {
+                "StructProperty" => {
+                    let s = self.name(r)?;
+                    r.take(16)?; // struct guid
+                    vec![s]
+                }
+                "BoolProperty" => vec![(r.u8()? != 0).to_string()],
+                "ByteProperty" | "EnumProperty" | "ArrayProperty" | "SetProperty" | "OptionalProperty" => vec![self.name(r)?],
+                "MapProperty" => vec![self.name(r)?, self.name(r)?],
+                _ => vec![],
+            };
+            if r.u8()? != 0 {
+                r.take(16)?; // property guid
+            }
+            let start = r.p;
+            if size > r.left() {
+                return Err(format!("{name}: value of {size} bytes runs past the export").into());
+            }
+            let mut vr = Rd { d: &r.d[..start + size], p: start };
+            let v = at(format_args!(".{name}"), self.tagged_value(&mut vr, &ty, &tag, size, depth))
+                .unwrap_or_else(|e| Value::Str(format!("<error: {e}>")));
+            r.p = start + size;
+            out.push((if idx > 0 { format!("{name}[{idx}]") } else { name }, v));
+        }
+    }
+
+    fn tagged_value(&self, r: &mut Rd, ty: &str, tag: &[String], size: usize, depth: u32) -> Res<Value> {
+        Ok(match ty {
+            "BoolProperty" => Value::Bool(tag[0] == "true"),
+            "StructProperty" => self.tagged_struct(r, &tag[0], depth)?,
+            "ByteProperty" if size == 1 => Value::UInt(r.u8()? as u64),
+            "ByteProperty" | "EnumProperty" => Value::Enum(self.name(r)?),
+            "ArrayProperty" | "SetProperty" => {
+                if ty == "SetProperty" {
+                    for _ in 0..r.count(1)? {
+                        self.tagged_elem(r, &tag[0], None, depth)?; // removed elements
+                    }
+                }
+                let n = r.count(1)?;
+                let mut sname = None;
+                if tag[0] == "StructProperty" && ty == "ArrayProperty" {
+                    // arrays of structs carry one inner tag naming the struct
+                    self.name(r)?;
+                    self.name(r)?;
+                    r.take(8)?;
+                    sname = Some(self.name(r)?);
+                    r.take(16)?;
+                    if r.u8()? != 0 {
+                        r.take(16)?;
+                    }
+                }
+                let per = (n > 0).then(|| r.left() / n); // bytes per element, for ByteProperty arrays
+                let mut a = Vec::with_capacity(n.min(1 << 16));
+                for i in 0..n {
+                    let v = match &sname {
+                        Some(s) => self.tagged_struct(r, s, depth),
+                        None => self.tagged_elem(r, &tag[0], per, depth),
+                    };
+                    a.push(at(format_args!("[{i}]"), v)?);
+                }
+                Value::Array(a)
+            }
+            "MapProperty" => {
+                for _ in 0..r.count(1)? {
+                    self.tagged_elem(r, &tag[0], None, depth)?; // removed keys
+                }
+                let n = r.count(2)?;
+                let mut m = Vec::with_capacity(n.min(1 << 16));
+                for i in 0..n {
+                    let k = at(format_args!("[{i}].key"), self.tagged_elem(r, &tag[0], None, depth))?;
+                    m.push((k, at(format_args!("[{i}].value"), self.tagged_elem(r, &tag[1], None, depth))?));
+                }
+                Value::Map(m)
+            }
+            _ => self.tagged_elem(r, ty, Some(size), depth)?,
+        })
+    }
+
+    /// A value without its own tag (container element / map key or value). `per` = its size, if known.
+    fn tagged_elem(&self, r: &mut Rd, ty: &str, per: Option<usize>, depth: u32) -> Res<Value> {
+        let t = match ty {
+            "BoolProperty" => return Ok(Value::Bool(r.u8()? != 0)),
+            "ByteProperty" if per == Some(1) => Ty::Byte,
+            "ByteProperty" | "EnumProperty" => return Ok(Value::Enum(self.name(r)?)),
+            // ponytail: untagged struct keys/values (sets, maps) carry no struct name; assume a tagged struct
+            "StructProperty" => return Ok(Value::Struct(String::new(), self.tagged(r, depth + 1)?)),
+            "Int8Property" => Ty::Int8,
+            "Int16Property" => Ty::Int16,
+            "IntProperty" => Ty::Int,
+            "Int64Property" => Ty::Int64,
+            "UInt16Property" => Ty::UInt16,
+            "UInt32Property" => Ty::UInt32,
+            "UInt64Property" => Ty::UInt64,
+            "FloatProperty" => Ty::Float,
+            "DoubleProperty" => Ty::Double,
+            "NameProperty" => Ty::Name,
+            "StrProperty" => Ty::Str,
+            "TextProperty" => Ty::Text,
+            "ObjectProperty" | "ClassProperty" | "WeakObjectProperty" | "InterfaceProperty" => Ty::Object,
+            "SoftObjectProperty" | "SoftClassProperty" | "AssetObjectProperty" | "AssetClassProperty" => Ty::SoftObject,
+            "LazyObjectProperty" => Ty::Lazy,
+            "DelegateProperty" => Ty::Delegate,
+            "MulticastDelegateProperty" | "MulticastInlineDelegateProperty" | "MulticastSparseDelegateProperty" => Ty::MulticastDelegate,
+            "FieldPathProperty" => Ty::FieldPath,
+            t => return Err(format!("property type {t} not supported").into()),
+        };
+        self.value(r, &t, false, depth)
+    }
+
+    fn tagged_struct(&self, r: &mut Rd, sname: &str, depth: u32) -> Res<Value> {
+        Ok(match self.native(r, sname) {
+            Ok(Some(v)) => v,
+            Ok(None) => Value::Struct(sname.into(), self.tagged(r, depth + 1)?),
+            // structs that are native in UE5 are often plain tagged structs in UE4
+            Err(e) => {
+                let p = r.p;
+                match self.tagged(r, depth + 1) {
+                    Ok(f) => Value::Struct(sname.into(), f),
+                    Err(_) => {
+                        r.p = p;
+                        return Err(e);
+                    }
+                }
+            }
+        })
+    }
+
     fn delegate(&self, r: &mut Rd) -> Res<Value> {
         let o = self.object(r)?;
         Ok(Value::Struct("Delegate".into(), vec![("Object".into(), Value::Object(o)), ("Function".into(), Value::Name(self.name(r)?))]))
@@ -566,12 +719,13 @@ impl Ctx<'_> {
         let i = |names: &[&str], vals: Vec<i64>| -> Value {
             Value::Struct(s.into(), names.iter().zip(vals).map(|(n, v)| (n.to_string(), Value::Int(v))).collect())
         };
-        let d = |r: &mut Rd, n: usize| (0..n).map(|_| r.f64()).collect::<Res<Vec<_>>>();
+        let ue4 = self.ue4(); // UE4: no large world coordinates, these structs hold floats
+        let d = |r: &mut Rd, n: usize| (0..n).map(|_| if ue4 { r.f32() } else { r.f64() }).collect::<Res<Vec<_>>>();
         let fl = |r: &mut Rd, n: usize| (0..n).map(|_| r.f32()).collect::<Res<Vec<_>>>();
         let int = |r: &mut Rd, n: usize| (0..n).map(|_| r.i32().map(|v| v as i64)).collect::<Res<Vec<_>>>();
         const XYZ: &[&str] = &["X", "Y", "Z", "W"];
         let bx = |r: &mut Rd, n: usize, dbl: bool| -> Res<Value> {
-            let v = if dbl { d(r, n * 2)? } else { fl(r, n * 2)? };
+            let v = if dbl && !ue4 { d(r, n * 2)? } else { fl(r, n * 2)? };
             let valid = r.u8()? != 0;
             let (a, b) = v.split_at(n);
             Ok(Value::Struct(s.into(), vec![
@@ -580,6 +734,34 @@ impl Ctx<'_> {
                 ("IsValid".into(), Value::Bool(valid)),
             ]))
         };
+        if ue4 {
+            // UE4 native layouts that differ from (or are tagged in) UE5
+            match s {
+                "NiagaraVariableBase" | "NiagaraVariable" | "NiagaraVariableWithOffset" => {
+                    let mut f = vec![("Name".into(), Value::Name(self.name(r)?)), ("TypeDef".into(), Value::Struct("NiagaraTypeDefinition".into(), self.tagged(r, 1)?))];
+                    match s {
+                        "NiagaraVariable" => {
+                            let n = r.count(1)?;
+                            f.push(("VarDataSize".into(), Value::UInt(r.take(n)?.len() as u64)));
+                        }
+                        "NiagaraVariableWithOffset" => f.push(("Offset".into(), Value::Int(r.i32()? as i64))),
+                        _ => {}
+                    }
+                    return Ok(Some(Value::Struct(s.into(), f)));
+                }
+                "MovieSceneFrameRange" => {
+                    let bound = |r: &mut Rd| -> Res<Value> {
+                        let kind = r.u8()?; // 0 exclusive, 1 inclusive, 2 open
+                        Ok(i(&["Type", "Value"], vec![kind as i64, r.i32()? as i64]))
+                    };
+                    let lo = bound(r)?;
+                    return Ok(Some(Value::Struct(s.into(), vec![("Lower".into(), lo), ("Upper".into(), bound(r)?)])));
+                }
+                "MovieSceneEvaluationKey" => return Ok(Some(i(&["SequenceID", "TrackIdentifier", "SectionIndex"], int(r, 3)?))),
+                "MovieSceneSequenceID" | "MovieSceneTrackIdentifier" => return Ok(Some(Value::UInt(r.u32()? as u64))),
+                _ => {}
+            }
+        }
         Ok(Some(match s {
             "Vector" | "Vector_NetQuantize" | "Vector_NetQuantize10" | "Vector_NetQuantize100" | "Vector_NetQuantizeNormal" | "Vector3d" => f(XYZ, d(r, 3)?),
             "Vector2D" => f(XYZ, d(r, 2)?),
@@ -753,7 +935,13 @@ pub fn class_kind(pkg: &ZenPackage, i: usize, res: &Resolver) -> &'static str {
 /// so callers (e.g. texture decoding) can continue reading native data after the properties.
 pub fn read_properties(pkg: &ZenPackage, i: usize, class: &str, maps: &Mappings, res: &Resolver) -> Res<(Vec<(String, Value)>, usize)> {
     if pkg.flags & UNVERSIONED == 0 {
-        return Err("package uses tagged (versioned) properties: not supported".into());
+        if pkg.import_paths.is_empty() {
+            return Err("zen package with tagged (versioned) properties: not supported".into());
+        }
+        let ctx = Ctx { pkg, maps, res };
+        let mut r = Rd { d: pkg.export_data(i), p: 0 };
+        let props = ctx.tagged(&mut r, 0)?;
+        return Ok((props, r.p));
     }
     let e = pkg.exports.get(i).ok_or("bad export index")?;
     if e.class_index >> 62 != 1 {
@@ -871,7 +1059,10 @@ fn plausible(v: &Value) -> bool {
 pub fn read_properties_drift(pkg: &ZenPackage, i: usize, class: &str, maps: &Mappings, res: &Resolver, drift: &[Drift], tails: &[(&[u8], bool)]) -> Partial {
     let mut out = Partial { props: vec![], error: None, header: vec![], end: None };
     if pkg.flags & UNVERSIONED == 0 || pkg.exports.get(i).is_none_or(|e| e.class_index >> 62 != 1) {
-        out.error = read_properties(pkg, i, class, maps, res).err().map(|e| e.to_string()); // tagged / BP class
+        match read_properties(pkg, i, class, maps, res) {
+            Ok((p, n)) => (out.props, out.end) = (p, Some(n)), // tagged: complete, no header
+            Err(e) => out.error = Some(e.to_string()), // BP class of an unversioned package
+        }
         return out;
     }
     let chain = match drift_chain(maps, class, drift) {
@@ -994,6 +1185,20 @@ pub fn check_trailer(pkg: &ZenPackage, i: usize, consumed: usize) -> Option<Stri
 pub fn read_datatable(pkg: &ZenPackage, i: usize, props: &[(String, Value)], consumed: usize, maps: &Mappings, res: &Resolver) -> Res<Vec<(String, Value)>> {
     let row = props.iter().find(|p| p.0 == "RowStruct").map(|p| &p.1);
     let Some(Value::Object(path)) = row else { return Err("DataTable without RowStruct".into()) };
+    if pkg.flags & UNVERSIONED == 0 {
+        let ctx = Ctx { pkg, maps, res };
+        let mut r = Rd { d: pkg.export_data(i), p: consumed };
+        r.take(4)?; // guid flag (0)
+        let n = r.count(10)?;
+        let sname = path.rsplit('.').next().unwrap_or(path);
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name = ctx.name(&mut r)?;
+            let v = at(format_args!("rows[{name}]"), ctx.tagged(&mut r, 1))?;
+            rows.push((name, Value::Struct(sname.into(), v)));
+        }
+        return Ok(rows);
+    }
     if !path.starts_with("/Script/") {
         return Err(format!("RowStruct {path} is a user-defined struct: schema unknown").into());
     }
@@ -1031,7 +1236,8 @@ pub fn report(pkg: &ZenPackage, i: usize, maps: &Mappings, res: &Resolver) -> Re
     let props = read_properties(pkg, i, &class, maps, res).map_err(|e| e.to_string());
     let (mut warning, mut rows) = (None, None);
     if let Ok((p, n)) = &props {
-        warning = check_slots(pkg, i, &class, maps).or_else(|| check_trailer(pkg, i, *n));
+        let slots = if pkg.flags & UNVERSIONED != 0 { check_slots(pkg, i, &class, maps) } else { None };
+        warning = slots.or_else(|| check_trailer(pkg, i, *n));
         if class == "DataTable" || class == "CompositeDataTable" {
             rows = Some(read_datatable(pkg, i, p, *n, maps, res).map_err(|e| e.to_string()));
         }
@@ -1227,6 +1433,7 @@ mod tests {
             imported_packages: vec![],
             imported_package_names: vec![],
             imported_public_export_hashes: vec![],
+            import_paths: vec![],
             imports: vec![],
             exports: vec![],
             data: vec![],

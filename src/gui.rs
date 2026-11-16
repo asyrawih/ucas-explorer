@@ -75,11 +75,11 @@ struct App {
     tab: Tab,
     tex: Option<Result<(texture::Image, Option<egui::TextureHandle>), String>>,
     mesh: Option<Result<Vec<mesh::Mesh>, String>>,
-    mesh_rot: (f32, f32), // yaw, pitch (radians)
-    mesh_tex: Option<Vec<Option<egui::TextureHandle>>>, // per material slot; None = not loaded yet
+    mesh_rot: crate::viewport::Camera,
+    mesh_tex: Option<Vec<preview::Tex>>, // per material slot; None = not loaded yet
     mesh_tex_rx: Option<Receiver<preview::SlotImages>>,
     /// material tab: (parameter, texture name, role, uploaded texture), diffuse first
-    mat_tex: Option<Vec<(String, String, &'static str, Option<egui::TextureHandle>)>>,
+    mat_tex: Option<Vec<(String, String, &'static str, Option<egui::TextureHandle>, preview::Tex)>>,
     mat_rx: Option<Receiver<preview::MaterialImages>>,
     anim: Option<Result<anim::Anim, String>>,
     props: Option<(props::Report, Vec<String>)>, // report + its JSON lines
@@ -87,6 +87,8 @@ struct App {
     bp: Option<Result<bp::Assembly, String>>,
     bp_mesh: Option<(mesh::Mesh, Vec<String>)>,
     bp_rx: Option<Receiver<preview::BpBuilt>>,
+    /// focus mode (Ctrl+Space): the preview panel fills the window, tree and file list hidden
+    focus: bool,
 }
 
 fn hex_view(ui: &mut egui::Ui, id: &str, data: &[u8]) {
@@ -181,6 +183,30 @@ fn save_anim(l: &Loaded, a: &Asset, i: usize, path: &str, out_dir: &str) -> Res<
     Ok((dst, mesh))
 }
 
+/// Uploads a decoded image for display; None if it is too large for the GPU (or malformed).
+fn upload_image(ctx: &egui::Context, name: &str, img: &texture::Image) -> Option<egui::TextureHandle> {
+    let max = ctx.input(|i| i.max_texture_side);
+    let n = img.width as usize * img.height as usize * 4;
+    (img.width as usize <= max && img.height as usize <= max && img.rgba.len() == n).then(|| {
+        let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba);
+        ctx.load_texture(name, ci, Default::default())
+    })
+}
+
+/// Draws an uploaded image scaled to fit the remaining space, or a note if it could not be uploaded.
+fn fit_image(ui: &mut egui::Ui, img: &texture::Image, handle: &Option<egui::TextureHandle>) {
+    match handle {
+        Some(t) => {
+            let avail = ui.available_size() - egui::vec2(4.0, 4.0); // slack, else the resizable panel creeps wider
+            let s = (avail.x / img.width as f32).min(avail.y / img.height as f32);
+            ui.add(egui::Image::new(t).fit_to_exact_size(egui::vec2(img.width as f32, img.height as f32) * s));
+        }
+        None => {
+            ui.weak("too large (or malformed) to display; export still works");
+        }
+    }
+}
+
 fn is_texture(name: &str, class: &str) -> bool {
     class.contains("Texture") || (class == "?" && name.starts_with("T_"))
 }
@@ -202,10 +228,32 @@ fn write_file(path: &Path, data: &[u8]) -> Res<()> {
     Ok(())
 }
 
+/// .uexp / .ubulk / .uptnl next to a .uasset/.umap: part of that package, hidden from the tree and
+/// search, extracted along with it.
+fn is_companion(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, e)| matches!(e, "uexp" | "ubulk" | "uptnl"))
+}
+
+/// `files` plus the companions of every package among them (toc.files is sorted by path).
+fn with_companions(toc: &Toc, files: Vec<usize>) -> Vec<usize> {
+    let mut out = files.clone();
+    for f in files {
+        let path = &toc.files[f].0;
+        let Some((stem, "uasset" | "umap")) = path.rsplit_once('.') else { continue };
+        for ext in ["uexp", "ubulk", "uptnl"] {
+            let c = format!("{stem}.{ext}");
+            if let Ok(k) = toc.files.binary_search_by(|(p, _)| p.as_str().cmp(&c)) {
+                out.push(k);
+            }
+        }
+    }
+    out
+}
+
 fn build_tree(toc: &Toc) -> Vec<Dir> {
     let mut dirs = vec![Dir { name: "/".into(), parent: 0, dirs: vec![], files: vec![] }];
     let mut lookup: HashMap<(usize, &str), usize> = HashMap::new();
-    for (i, (path, _)) in toc.files.iter().enumerate() {
+    for (i, (path, _)) in toc.files.iter().enumerate().filter(|(_, (p, _))| !is_companion(p)) {
         let mut cur = 0;
         let mut parts = path.split('/').peekable();
         while let Some(part) = parts.next() {
@@ -251,13 +299,16 @@ impl App {
             let dirs = build_tree(&toc);
             let lower = toc.files.iter().map(|(p, _)| p.to_lowercase()).collect();
             let ucas = File::open(data_path(&path)).ok();
-            let maps = props::Mappings::find(&path, props::game_name(&toc.files).as_deref())
-                .ok_or_else(|| "drop a .usmap on the window; it is remembered for this game".to_string())
-                .and_then(|p| props::Mappings::load(&p).map_err(|e| format!("{}: {e}", p.display())));
+            let maps = match props::Mappings::find(&path, props::game_name(&toc.files).as_deref()) {
+                Some(p) => props::Mappings::load(&p).map_err(|e| format!("{}: {e}", p.display())),
+                None if toc.pak.is_some() => Ok(props::Mappings::default()), // legacy .pak: tagged properties
+                None => Err("drop a .usmap on the window; it is remembered for this game".to_string()),
+            };
             Ok(Loaded { utoc: path.clone(), toc: Arc::new(toc), dirs, lower, ucas, resolver: Arc::default(), maps })
         })() {
             Ok(mut l) => {
                 let res_note = match Resolver::load(&path.with_file_name("global.utoc"), &l.toc) {
+                    _ if l.toc.unity.is_some() => format!("  ·  Unity {}", l.toc.unity.as_ref().unwrap().unity),
                     Ok(r) => {
                         l.resolver = Arc::new(r);
                         String::new()
@@ -306,12 +357,12 @@ impl App {
 
     fn select_export(&mut self, i: usize) {
         self.export = Some(i);
-        (self.tex, self.mesh, self.mesh_rot, self.anim, self.props) = (None, None, (0.6, 0.35), None, None);
+        (self.tex, self.mesh, self.mesh_rot, self.anim, self.props) = (None, None, Default::default(), None, None);
         let has_maps = self.loaded.as_ref().is_some_and(|l| l.maps.is_ok());
         (self.mesh_tex, self.mesh_tex_rx, self.mat_tex, self.mat_rx) = (None, None, None, None);
         (self.bp, self.bp_mesh, self.bp_rx) = (None, None, None);
         if let Some(Ok(a)) = &self.asset {
-            if a.classes[i] == "BlueprintGeneratedClass" {
+            if bp::is_3d_class(&a.classes[i]) || (i == bp::main_export(&a.pkg) && bp::references_meshes(&a.pkg) && !is_material(&a.classes[i])) {
                 self.tab = Tab::Blueprint;
             } else if is_texture(&a.pkg.exports[i].name, &a.classes[i]) {
                 self.tab = Tab::Texture;
@@ -352,6 +403,9 @@ impl App {
             });
             self.asset_rx = Some(rx);
         }
+        if l.toc.unity.as_ref().is_some_and(|u| matches!(u.class(l.toc.files[f].1), 28 | 43 | 83)) {
+            return; // previewed decoded in the info panel, not as hex
+        }
         let Some(ucas) = &mut l.ucas else {
             self.status = "missing data file (.ucas next to .utoc)".into();
             return;
@@ -367,6 +421,7 @@ impl App {
         if self.job.as_ref().is_some_and(|j| !j.done.load(Relaxed)) {
             return;
         }
+        let files = with_companions(&l.toc, files);
         let job = Job {
             total: files.len(),
             ok: Default::default(),
@@ -458,8 +513,9 @@ impl eframe::App for App {
                     // auto-select the main export: first texture/mesh, else the only one
                     let main = match &self.asset {
                         Some(Ok(a)) => (0..a.pkg.exports.len())
-                            .find(|&i| is_texture(&a.pkg.exports[i].name, &a.classes[i]) || is_mesh(&a.classes[i]) || a.classes[i] == "BlueprintGeneratedClass")
-                            .or((a.pkg.exports.len() == 1).then_some(0)),
+                            .find(|&i| is_texture(&a.pkg.exports[i].name, &a.classes[i]) || is_mesh(&a.classes[i]))
+                            .or_else(|| bp::main_3d_export(res, &a.pkg))
+                            .or((!a.pkg.exports.is_empty()).then(|| bp::main_export(&a.pkg))),
                         _ => None,
                     };
                     if let Some(i) = main {
@@ -477,16 +533,18 @@ impl eframe::App for App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("archive:");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(420.0).hint_text(".utoc / .ucas / .pak (or drop it here)"));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(420.0).hint_text(".utoc / .ucas / .pak / .assets (or drop it here)"));
                 if ui.button("Open").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                     self.open(PathBuf::from(self.path_input.trim()));
                 }
+                ui.separator();
+                ui.toggle_value(&mut self.focus, "⛶ Focus view").on_hover_text("preview fills the window (Ctrl+Space)");
                 ui.separator();
                 ui.label("🔍");
                 if ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(260.0).hint_text("search all files")).changed() {
                     let q = self.search.to_lowercase();
                     self.results = match &self.loaded {
-                        Some(l) if !q.is_empty() => (0..l.lower.len()).filter(|&i| l.lower[i].contains(&q)).collect(),
+                        Some(l) if !q.is_empty() => (0..l.lower.len()).filter(|&i| l.lower[i].contains(&q) && !is_companion(&l.lower[i])).collect(),
                         _ => vec![],
                     };
                 }
@@ -496,9 +554,10 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
-                if let Some(l) = &self.loaded {
+                if let Some(l) = self.loaded.as_ref().filter(|l| l.toc.unity.is_none()) {
                     ui.separator();
                     match &l.maps {
+                        Ok(m) if m.file.as_os_str().is_empty() => ui.weak("mappings: not needed (tagged properties)"),
                         Ok(m) => ui.label(format!("mappings: {}", m.file.file_name().unwrap_or_default().to_string_lossy())),
                         Err(e) => ui.weak(format!("mappings: none ({e})")),
                     };
@@ -518,17 +577,23 @@ impl eframe::App for App {
 
         if self.loaded.is_none() {
             egui::CentralPanel::default().show(ui, |ui| {
-                ui.centered_and_justified(|ui| ui.heading("Drop a .utoc, .ucas or .pak file here or enter its path above"));
+                ui.centered_and_justified(|ui| ui.heading("Drop a .utoc, .ucas, .pak or Unity .assets file here or enter its path above"));
             });
             return;
         }
 
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Space)) {
+            self.focus = !self.focus;
+        }
+        let focus = self.focus;
         let mut cur = self.cur_dir;
-        egui::Panel::left("tree").resizable(true).default_size(280.0).show(ui, |ui| {
-            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                tree(ui, &self.loaded.as_ref().unwrap().dirs, 0, &mut cur);
+        if !focus {
+            egui::Panel::left("tree").resizable(true).default_size(280.0).show(ui, |ui| {
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    tree(ui, &self.loaded.as_ref().unwrap().dirs, 0, &mut cur);
+                });
             });
-        });
+        }
         if cur != self.cur_dir {
             self.cur_dir = cur;
             self.search.clear();
@@ -537,7 +602,7 @@ impl eframe::App for App {
 
         let mut action: Option<Vec<usize>> = None;
         let mut export_clicked = None;
-        egui::Panel::right("info").resizable(true).default_size(460.0).show(ui, |ui| {
+        let info = |ui: &mut egui::Ui| {
             ui.horizontal(|ui| {
                 ui.label("Export to:");
                 ui.text_edit_singleline(&mut self.out_dir);
@@ -560,6 +625,65 @@ impl eframe::App for App {
                 action = Some(vec![f]);
             }
             ui.separator();
+            if let Some(u) = &l.toc.unity {
+                let e = *entry;
+                match u.class(e) {
+                    28 => {
+                        let r = self.tex.get_or_insert_with(|| {
+                            let img = u.texture(e).map_err(|e| e.to_string())?;
+                            let handle = upload_image(ui.ctx(), path, &img);
+                            Ok((img, handle))
+                        });
+                        match r {
+                            Err(e) => {
+                                ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+                            }
+                            Ok((img, handle)) => {
+                                ui.label(format!("{} x {}  ·  Texture2D  ·  Extract file saves the PNG", img.width, img.height));
+                                fit_image(ui, img, handle);
+                            }
+                        }
+                        return;
+                    }
+                    43 => {
+                        match self.mesh.get_or_insert_with(|| u.mesh(e).map(|m| vec![m]).map_err(|e| e.to_string())) {
+                            Err(e) => {
+                                ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+                            }
+                            Ok(m) => {
+                                // materials -> textures (first call per file builds the mesh->renderer index)
+                                let tex = self.mesh_tex.get_or_insert_with(|| {
+                                    u.mesh_textures(e)
+                                        .into_iter()
+                                        .map(|t| t.map(|i| std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied([i.width as usize, i.height as usize], &i.rgba))))
+                                        .collect()
+                                });
+                                ui.horizontal(|ui| {
+                                    let n = tex.iter().filter(|t| t.is_some()).count();
+                                    ui.label(format!("{} verts, {} tris  ·  {n}/{} slots textured", m[0].positions.len(), m[0].tris(), m[0].sections.len()));
+                                    if ui.button("Save OBJ + textures").clicked() {
+                                        self.status = match out_path(&self.out_dir, path, ".obj").and_then(|p| u.save_obj_textured(e, &p).map(|_| p)) {
+                                            Ok(p) => format!("saved {}", p.display()),
+                                            Err(e) => format!("save failed: {e}"),
+                                        };
+                                    }
+                                });
+                                preview::mesh_view(ui, &m[0], tex, &mut self.mesh_rot);
+                            }
+                        }
+                        return;
+                    }
+                    83 => {
+                        match u.audio_info(e) {
+                            Ok(s) => ui.label(format!("AudioClip  ·  {s}")),
+                            Err(e) => ui.colored_label(ui.visuals().error_fg_color, e.to_string()),
+                        };
+                        ui.weak(if path.ends_with(".wav") { "Extract file decodes it to WAV" } else { "Extract file saves the raw FSB5 (play/convert with vgmstream)" });
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             if self.asset_rx.is_some() {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -606,8 +730,9 @@ impl eframe::App for App {
                         } else if self.tab == Tab::Anim {
                             self.tab = Tab::Hex;
                         }
-                        if class == "BlueprintGeneratedClass" {
-                            ui.selectable_value(&mut self.tab, Tab::Blueprint, "Blueprint");
+                        // any export: assemblies, Skeleton -> SkeletalMesh, or meshes it references (bp::assemble_any)
+                        if !is_tex && !is_mesh(class) {
+                            ui.selectable_value(&mut self.tab, Tab::Blueprint, "3D");
                         } else if self.tab == Tab::Blueprint {
                             self.tab = Tab::Hex;
                         }
@@ -624,7 +749,7 @@ impl eframe::App for App {
                                     let (_, e) = l.toc.files.iter().find(|(q, _)| q == p)?;
                                     read_chunk(&l.toc, &mut ucas, *e, u64::MAX).ok()
                                 };
-                                bp::assemble(&l.resolver, maps, &a.pkg, &mut load).map_err(|e| e.to_string())
+                                bp::assemble_any(&l.resolver, maps, &a.pkg, i, &mut load).map_err(|e| e.to_string())
                             });
                             match r {
                                 Err(e) => {
@@ -636,7 +761,7 @@ impl eframe::App for App {
                                         self.bp_rx = Some(preview::spawn_bp(ui.ctx().clone(), l.toc.clone(), l.utoc.clone(), l.resolver.clone(), asm.clone()));
                                     }
                                     if let Some((m, imgs, w)) = self.bp_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-                                        self.mesh_tex = Some(preview::upload(ui.ctx(), imgs));
+                                        self.mesh_tex = Some(preview::prepare(imgs));
                                         self.bp_mesh = Some((m, w));
                                         self.bp_rx = None;
                                     }
@@ -652,7 +777,7 @@ impl eframe::App for App {
                                         }
                                     });
                                     let warn = ui.visuals().warn_fg_color;
-                                    egui::CollapsingHeader::new(format!("parts ({})", asm.parts.len())).default_open(true).show(ui, |ui| {
+                                    egui::CollapsingHeader::new(format!("parts ({})", asm.parts.len())).default_open(asm.parts.len() <= 50).show(ui, |ui| {
                                         egui::ScrollArea::vertical().id_salt("bpparts").max_height(180.0).auto_shrink([false, true]).show(ui, |ui| {
                                             for p in &asm.parts {
                                                 let mesh = p.mesh.as_deref().map_or("-", |m| m.rsplit('/').next().unwrap_or(m));
@@ -686,8 +811,8 @@ impl eframe::App for App {
                                             if m.indices.is_empty() {
                                                 ui.weak("no mesh parts to preview");
                                             } else {
-                                                ui.weak(format!("{} tris  ·  drag to rotate", m.tris()));
-                                                preview::mesh_view(ui, m, self.mesh_tex.as_deref().unwrap_or(&[]), &mut self.mesh_rot);
+                                                ui.weak(format!("{} tris", m.tris()));
+                                                preview::mesh_view_framed(ui, m, self.mesh_tex.as_deref().unwrap_or(&[]), &mut self.mesh_rot, preview::part_framing(asm));
                                             }
                                         }
                                     }
@@ -708,9 +833,10 @@ impl eframe::App for App {
                                     imgs.into_iter()
                                         .enumerate()
                                         .map(|(k, (param, tex, role, img))| {
-                                            let h = img.filter(|i| i.size[0] <= max && i.size[1] <= max)
-                                                .map(|i| ctx.load_texture(format!("mat{k}"), i, egui::TextureOptions::LINEAR_REPEAT));
-                                            (param, tex, role, h)
+                                            let img = img.map(std::sync::Arc::new);
+                                            let h = img.as_ref().filter(|i| i.size[0] <= max && i.size[1] <= max)
+                                                .map(|i| ctx.load_texture(format!("mat{k}"), (**i).clone(), egui::TextureOptions::LINEAR_REPEAT));
+                                            (param, tex, role, h, img)
                                         })
                                         .collect(),
                                 );
@@ -736,7 +862,7 @@ impl eframe::App for App {
                                     // thumbnails: parameter, texture, role
                                     egui::ScrollArea::vertical().id_salt("matthumbs").max_height(170.0).show(ui, |ui| {
                                         ui.horizontal_wrapped(|ui| {
-                                            for (param, tex, role, h) in t {
+                                            for (param, tex, role, h, _) in t {
                                                 ui.vertical(|ui| {
                                                     ui.set_width(110.0);
                                                     match h {
@@ -756,8 +882,7 @@ impl eframe::App for App {
                                         });
                                     });
                                     // sphere with the diffuse (first entry if it is one)
-                                    let diffuse = t.iter().find(|x| x.2 == "diffuse").or(t.first()).and_then(|x| x.3.clone());
-                                    ui.weak("drag to rotate");
+                                    let diffuse = t.iter().find(|x| x.2 == "diffuse").or(t.first()).and_then(|x| x.4.clone());
                                     preview::mesh_view(ui, &preview::sphere(), &[diffuse], &mut self.mesh_rot);
                                 }
                                 None => {}
@@ -847,11 +972,10 @@ impl eframe::App for App {
                                         ));
                                     }
                                     if let Some(imgs) = self.mesh_tex_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-                                        self.mesh_tex = Some(preview::upload(ui.ctx(), imgs));
+                                        self.mesh_tex = Some(preview::prepare(imgs));
                                         self.mesh_tex_rx = None;
                                     }
                                     ui.horizontal(|ui| {
-                                        ui.weak("drag to rotate");
                                         if self.mesh_tex_rx.is_some() {
                                             ui.spinner();
                                             ui.weak("loading textures…");
@@ -884,14 +1008,9 @@ impl eframe::App for App {
                         },
                         Tab::Texture => {
                             let r = self.tex.get_or_insert_with(|| {
-                                let img = texture::decode_texture2d(a.pkg.export_data(i), None, a.ubulk.as_deref())
+                                let img = texture::decode_texture(&a.pkg, i, a.ubulk.as_deref())
                                     .map_err(|e| e.to_string())?;
-                                let max = ui.ctx().input(|i| i.max_texture_side);
-                                let n = img.width as usize * img.height as usize * 4;
-                                let handle = (img.width as usize <= max && img.height as usize <= max && img.rgba.len() == n).then(|| {
-                                    let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba);
-                                    ui.ctx().load_texture(name.as_str(), ci, Default::default())
-                                });
+                                let handle = upload_image(ui.ctx(), name, &img);
                                 Ok((img, handle))
                             });
                             match r {
@@ -910,16 +1029,7 @@ impl eframe::App for App {
                                             };
                                         }
                                     });
-                                    match handle {
-                                        Some(t) => {
-                                            let avail = ui.available_size() - egui::vec2(4.0, 4.0); // slack, else the resizable panel creeps wider
-                                            let s = (avail.x / img.width as f32).min(avail.y / img.height as f32);
-                                            ui.add(egui::Image::new(&*t).fit_to_exact_size(egui::vec2(img.width as f32, img.height as f32) * s));
-                                        }
-                                        None => {
-                                            ui.weak("too large (or malformed) to display; Save PNG still works");
-                                        }
-                                    }
+                                    fit_image(ui, img, handle);
                                 }
                             }
                         }
@@ -931,7 +1041,12 @@ impl eframe::App for App {
                 ui.weak(format!("hex preview: first {}", human(PREVIEW_BYTES)));
             }
             hex_view(ui, "hex", &self.preview);
-        });
+        };
+        if focus {
+            egui::CentralPanel::default().show(ui, info);
+        } else {
+            egui::Panel::right("info").resizable(true).default_size(460.0).show(ui, info);
+        }
         if let Some(i) = export_clicked {
             self.select_export(i);
         }
@@ -940,31 +1055,33 @@ impl eframe::App for App {
         }
 
         let mut clicked = None;
-        egui::CentralPanel::default().show(ui, |ui| {
-            let l = self.loaded.as_ref().unwrap();
-            let searching = !self.search.is_empty();
-            let list: &[usize] = if searching { &self.results } else { &l.dirs[self.cur_dir].files };
-            ui.label(if searching {
-                format!("{} results", list.len())
-            } else {
-                format!("/{}  ·  {} folders, {} files", self.dir_path(self.cur_dir), l.dirs[self.cur_dir].dirs.len(), list.len())
+        if !focus {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let l = self.loaded.as_ref().unwrap();
+                let searching = !self.search.is_empty();
+                let list: &[usize] = if searching { &self.results } else { &l.dirs[self.cur_dir].files };
+                ui.label(if searching {
+                    format!("{} results", list.len())
+                } else {
+                    format!("/{}  ·  {} folders, {} files", self.dir_path(self.cur_dir), l.dirs[self.cur_dir].dirs.len(), list.len())
+                });
+                ui.separator();
+                let row_h = ui.spacing().interact_size.y;
+                egui::ScrollArea::vertical().id_salt("files").auto_shrink(false).show_rows(ui, row_h, list.len(), |ui, range| {
+                    for &f in &list[range] {
+                        let (path, entry) = &l.toc.files[f];
+                        let name = if searching { path.as_str() } else { path.rsplit('/').next().unwrap_or(path) };
+                        let size = l.toc.size(*entry);
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(self.selected == Some(f), name).clicked() {
+                                clicked = Some(f);
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.weak(size.map(human).unwrap_or_default()));
+                        });
+                    }
+                });
             });
-            ui.separator();
-            let row_h = ui.spacing().interact_size.y;
-            egui::ScrollArea::vertical().id_salt("files").auto_shrink(false).show_rows(ui, row_h, list.len(), |ui, range| {
-                for &f in &list[range] {
-                    let (path, entry) = &l.toc.files[f];
-                    let name = if searching { path.as_str() } else { path.rsplit('/').next().unwrap_or(path) };
-                    let size = l.toc.size(*entry);
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(self.selected == Some(f), name).clicked() {
-                            clicked = Some(f);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.weak(size.map(human).unwrap_or_default()));
-                    });
-                }
-            });
-        });
+        }
         if let Some(f) = clicked {
             self.select(f);
         }
@@ -980,7 +1097,16 @@ pub fn run(path: Option<String>) -> Res<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 850.0]).with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("UCAS Explorer", opts, Box::new(|_| Ok(Box::new(app))))?;
+    eframe::run_native(
+        "UCAS Explorer",
+        opts,
+        Box::new(|cc| {
+            if let Some(rs) = cc.wgpu_render_state.clone() {
+                crate::viewport::init(rs);
+            }
+            Ok(Box::new(app))
+        }),
+    )?;
     Ok(())
 }
 
@@ -992,15 +1118,17 @@ mod tests {
             block_size: 1,
             ids: vec![],
             pak: None,
+            unity: None,
             chunks: vec![],
             blocks: vec![],
             methods: vec![],
-            files: vec![("A/B/x.uasset".into(), 0), ("A/y.uasset".into(), 1), ("A/B/z.uasset".into(), 2)],
+            files: vec![("A/B/x.uasset".into(), 0), ("A/B/x.uexp".into(), 1), ("A/B/z.uasset".into(), 2), ("A/y.uasset".into(), 3)],
         };
         let d = super::build_tree(&toc);
         assert_eq!(d.len(), 3); // root, A, B
-        assert_eq!(d[1].files, vec![1]);
-        assert_eq!(d[2].files, vec![0, 2]);
+        assert_eq!(d[1].files, vec![3]);
+        assert_eq!(d[2].files, vec![0, 2]); // x.uexp hidden...
+        assert_eq!(super::with_companions(&toc, vec![0]), vec![0, 1]); // ...but extracted with x.uasset
         assert_eq!(super::human(1536), "1.5 KB");
     }
 }

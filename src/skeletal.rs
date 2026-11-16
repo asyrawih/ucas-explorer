@@ -6,7 +6,8 @@
 //  2. FSkeletalMeshLODRenderData streamed data: FMultiSizeIndexContainer, FPositionVertexBuffer,
 //     FStaticMeshVertexBuffer, FSkinWeightVertexBuffer (found via the position-buffer signature).
 //  3. TArray<FSkelMeshRenderSection> whose triangle/vertex totals match that LOD (gives BoneMap + materials).
-// Layout verified on Palia (UE5.3+). Upgrade path: real FSkeletalMeshRenderData walk once property sizes are known.
+// Layout verified on Palia (UE5.3+) and Deep Rock Galactic (UE4.27: float FTransforms, older skin
+// weight / section layouts; each parser tries both). Upgrade path: real FSkeletalMeshRenderData walk once property sizes are known.
 use crate::Res;
 
 pub struct Bone {
@@ -47,6 +48,9 @@ impl<'a> Rd<'a> {
     fn f64(&mut self) -> Option<f64> {
         Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
+    fn f32(&mut self) -> Option<f64> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?) as f64)
+    }
     fn bool(&mut self) -> Option<bool> {
         match self.u32()? {
             0 => Some(false),
@@ -71,8 +75,8 @@ fn f16(h: u16) -> f32 {
     if s == 1 { -mag } else { mag }
 }
 
-/// FReferenceSkeleton at `at`: bone infos + FTransform (double) pose.
-fn parse_skeleton(d: &[u8], at: usize, names: &[String]) -> Option<Vec<Bone>> {
+/// FReferenceSkeleton at `at`: bone infos + FTransform pose (doubles in UE5, floats in UE4).
+fn parse_skeleton(d: &[u8], at: usize, names: &[String], dbl: bool) -> Option<Vec<Bone>> {
     let mut r = Rd(d, at);
     let n = r.u32()? as usize;
     if !(1..=4096).contains(&n) {
@@ -94,7 +98,7 @@ fn parse_skeleton(d: &[u8], at: usize, names: &[String]) -> Option<Vec<Bone>> {
     for (name, parent) in info {
         let mut v = [0f64; 10];
         for x in &mut v {
-            *x = r.f64()?;
+            *x = if dbl { r.f64()? } else { r.f32()? };
         }
         let ql = v[..4].iter().map(|x| x * x).sum::<f64>();
         if !v.iter().all(|x| x.is_finite() && x.abs() < 1e7) || (ql - 1.0).abs() > 1e-3 {
@@ -114,7 +118,7 @@ fn parse_skeleton(d: &[u8], at: usize, names: &[String]) -> Option<Vec<Bone>> {
 
 /// First FReferenceSkeleton found in `d` (SkeletalMesh or Skeleton export data).
 pub fn find_reference_skeleton(d: &[u8], names: &[String]) -> Option<Vec<Bone>> {
-    (0..d.len().saturating_sub(16)).find_map(|i| parse_skeleton(d, i, names))
+    (0..d.len().saturating_sub(16)).find_map(|i| parse_skeleton(d, i, names, true).or_else(|| parse_skeleton(d, i, names, false)))
 }
 
 struct Lod {
@@ -127,7 +131,7 @@ struct Lod {
 }
 
 /// FSkeletalMeshLODRenderData streamed data around the FPositionVertexBuffer at `at`.
-fn parse_lod(d: &[u8], at: usize) -> Option<Lod> {
+fn parse_lod(d: &[u8], at: usize, ue4: bool) -> Option<Lod> {
     let mut r = Rd(d, at);
     let (stride, n) = (r.u32()?, r.u32()? as usize);
     let (es, n2, pos) = r.bulk()?;
@@ -180,10 +184,11 @@ fn parse_lod(d: &[u8], at: usize) -> Option<Lod> {
 
     // FSkinWeightVertexBuffer (UE5): strip(2), bVariableBonesPerVertex, MaxBoneInfluences, NumBones, NumVertices,
     // bUse16BitBoneIndex, bUse16BitBoneWeight, bulk<u8> data, then lookup: strip(2), NumVertices, bulk<u32>
+    // UE4.27: no bUse16BitBoneWeight
     r.take(2)?;
     let var = r.bool()?;
     let (maxi, _nbones, snv) = (r.u32()? as usize, r.u32()?, r.u32()? as usize);
-    let (b16i, b16w) = (r.bool()?, r.bool()?);
+    let (b16i, b16w) = (r.bool()?, if ue4 { false } else { r.bool()? });
     let (wes, _, wdata) = r.bulk()?;
     r.take(2)?;
     let _ = r.u32()?;
@@ -246,8 +251,8 @@ struct Section {
     bone_map: Vec<u16>,
 }
 
-/// TArray<FSkelMeshRenderSection> at `at`.
-fn parse_sections(d: &[u8], at: usize) -> Option<Vec<Section>> {
+/// TArray<FSkelMeshRenderSection> at `at` (UE4.27: no bVisibleInRayTracing, one cloth mapping array).
+fn parse_sections(d: &[u8], at: usize, ue4: bool) -> Option<Vec<Section>> {
     let mut r = Rd(d, at);
     let n = r.u32()?;
     if !(1..=256).contains(&n) {
@@ -263,11 +268,18 @@ fn parse_sections(d: &[u8], at: usize) -> Option<Vec<Section>> {
             return None; // RecomputeTangentsVertexMaskChannel
         }
         r.bool()?; // bCastShadow
-        r.bool()?; // bVisibleInRayTracing
+        if !ue4 {
+            r.bool()?; // bVisibleInRayTracing
+        }
         let base_vertex = r.u32()?;
-        for _ in 0..r.u32()? {
-            let k = r.u32()? as usize; // ClothMappingDataLODs: TArray<TArray<FMeshToMeshVertData (64 bytes)>>
+        if ue4 {
+            let k = r.u32()? as usize; // ClothMappingData: TArray<FMeshToMeshVertData (64 bytes)>
             r.take(k.checked_mul(64)?)?;
+        } else {
+            for _ in 0..r.u32()? {
+                let k = r.u32()? as usize; // ClothMappingDataLODs: TArray<TArray<FMeshToMeshVertData (64 bytes)>>
+                r.take(k.checked_mul(64)?)?;
+            }
         }
         let nb = r.u32()? as usize;
         let bone_map = r.take(nb.checked_mul(2)?)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
@@ -275,8 +287,17 @@ fn parse_sections(d: &[u8], at: usize) -> Option<Vec<Section>> {
         let max_infl = r.u32()? & 0x7fff_ffff;
         r.take(2 + 20)?; // CorrespondClothAssetIndex, FClothingSectionData
         if class_strip & 1 == 0 {
-            r.bulk()?; // DuplicatedVertices: DupVertData, DupVertIndexData
-            r.bulk()?;
+            // DuplicatedVertices: DupVertData (u32), DupVertIndexData (FIndexLengthPair); UE4.27 writes
+            // plain TArrays (count only), UE5 TBulkArrays (element size + count)
+            if ue4 {
+                for es in [4usize, 8] {
+                    let k = r.u32()? as usize;
+                    r.take(k.checked_mul(es)?)?;
+                }
+            } else {
+                r.bulk()?;
+                r.bulk()?;
+            }
         }
         r.bool()?; // bDisabled
         if material < 0 || tris == 0 || !(1..=12).contains(&max_infl) {
@@ -292,7 +313,7 @@ fn scan_lods(d: &[u8], out: &mut Vec<Lod>) {
     let mut i = 0;
     while i + 16 <= d.len() {
         if u(i) == 12 && u(i + 8) == 12 && u(i + 4) == u(i + 12) && u(i + 4) > 0 {
-            if let Some(m) = parse_lod(d, i) {
+            if let Some(m) = parse_lod(d, i, false).or_else(|| parse_lod(d, i, true)) {
                 i += 16 + m.positions.len() * 12;
                 out.push(m);
                 continue;
@@ -320,7 +341,8 @@ pub fn decode_skeletal_mesh(pkg: &crate::zen::ZenPackage, export: usize, ubulk: 
         return Err("skeletal: no LOD vertex buffers found".into());
     }
     // section arrays live in the export (LOD headers); pair each LOD with the nearest matching one before it
-    let candidates: Vec<(usize, Vec<Section>)> = (0..d.len()).filter_map(|i| Some((i, parse_sections(d, i)?))).collect();
+    let candidates: Vec<(usize, Vec<Section>)> =
+        (0..d.len()).filter_map(|i| Some((i, parse_sections(d, i, false).or_else(|| parse_sections(d, i, true))?))).collect();
     let mut order: Vec<usize> = (0..lods.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lods[i].indices.len()));
     for li in order {
@@ -648,8 +670,9 @@ mod tests {
             }
         }
         let names = ["root".to_string(), "spine".to_string()];
-        assert!(parse_skeleton(&d, 0, &names).is_none());
-        let b = parse_skeleton(&d, 3, &names).unwrap();
+        assert!(parse_skeleton(&d, 0, &names, true).is_none());
+        assert!(parse_skeleton(&d, 3, &names, false).is_none()); // doubles don't parse as UE4 floats
+        let b = find_reference_skeleton(&d, &names).unwrap();
         assert_eq!((b[1].name.as_str(), b[1].parent), ("spine", 0));
         let (t, q, s) = conv_bone(&b[1]);
         let m = trs(t, q, s);

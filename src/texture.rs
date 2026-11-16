@@ -7,6 +7,67 @@ pub struct Image {
     pub rgba: Vec<u8>, // width*height*4
 }
 
+/// Texture2D export `i` of `pkg` (zen or legacy package) -> RGBA8.
+pub fn decode_texture(pkg: &crate::zen::ZenPackage, i: usize, ubulk: Option<&[u8]>) -> Res<Image> {
+    if pkg.import_paths.is_empty() {
+        decode_texture2d(pkg.export_data(i), None, ubulk)
+    } else {
+        decode_texture2d_ue4(&pkg.data, pkg.exports[i].data_offset, pkg.exports[i].data_size, ubulk)
+    }
+}
+
+/// UE4 cooked FTexturePlatformData: ... FirstMip NumMips, then per mip: i32 bCooked, FByteBulkData
+/// header (u32 flags, count, size [i64 if flags & 0x2000], i64 offset), [inline payload], SizeX SizeY SizeZ.
+/// `data` = whole package (.uasset+.uexp), export at `start..start+len`.
+fn decode_texture2d_ue4(data: &[u8], start: usize, len: usize, ubulk: Option<&[u8]>) -> Res<Image> {
+    let d = data.get(start..start + len).ok_or("texture: bad export range")?;
+    let u32_at = |o: usize| -> Res<u32> {
+        d.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or_else(|| "texture: truncated".into())
+    };
+    let u64_at = |o: usize| -> Res<u64> { Ok(u32_at(o)? as u64 | (u32_at(o + 4)? as u64) << 32) };
+    let mut p = find_platform_data(d, 0).ok_or("texture: no PF_* platform data found")?;
+    let packed = u32_at(p + 8)?;
+    let len = u32_at(p + 12)? as usize;
+    let fmt = std::str::from_utf8(&d[p + 16..p + 16 + len - 1]).map_err(|_| "texture: bad format string")?.to_string();
+    let (bw, bb) = fmt_info(&fmt).ok_or_else(|| format!("texture: unsupported pixel format {fmt}"))?;
+    p += 16 + len;
+    if packed & (1 << 30) != 0 {
+        p += 8; // FOptTexturePlatformData
+    }
+    let nmips = u32_at(p + 4)?;
+    if nmips == 0 || nmips > 32 {
+        return Err(format!("texture: bad mip count {nmips}").into());
+    }
+    p += 8;
+    let size_of = |w: u32, h: u32| (w as usize).div_ceil(bw) * (h as usize).div_ceil(bw) * bb;
+    let mut skipped = vec![];
+    for _ in 0..nmips {
+        let flags = u32_at(p + 4)?;
+        let wide = flags & 0x2000 != 0;
+        let (count, off) = if wide { (u64_at(p + 8)? as usize, u64_at(p + 24)? as usize) } else { (u32_at(p + 8)? as usize, u64_at(p + 16)? as usize) };
+        p += if wide { 32 } else { 24 };
+        let inline = flags & 0x40 != 0 || flags & 0x101 == 0;
+        let payload = if inline {
+            let s = d.get(p..p + count);
+            p += count;
+            s
+        } else if flags & 0x100 != 0 {
+            ubulk.and_then(|u| u.get(off..off + count)) // ponytail: .uptnl (flag 0x800) mips are skipped
+        } else if flags & 0x10000 != 0 {
+            data.get(off..off + count) // end of the package file, absolute offset
+        } else {
+            None
+        };
+        let (w, h) = (u32_at(p)?, u32_at(p + 4)?);
+        p += 12;
+        match payload {
+            Some(b) if b.len() >= size_of(w, h) => return decode(&fmt, &b[..size_of(w, h)], w, h),
+            _ => skipped.push(format!("{w}x{h} flags 0x{flags:x}")),
+        }
+    }
+    Err(format!("texture: no mip data available (missing .ubulk?): {}", skipped.join(", ")).into())
+}
+
 /// `export` = the Texture2D export's serialized data (ZenPackage::export_data).
 /// `props_end` = byte offset where properties end, if known (props::read_properties); None => find
 /// the native data heuristically (e.g. scan for the "PF_*" pixel format FString).
@@ -147,7 +208,7 @@ fn decode(fmt: &str, data: &[u8], w: u32, h: u32) -> Res<Image> {
     Ok(Image { width: w, height: h, rgba })
 }
 
-fn half_to_f32(h: u16) -> f32 {
+pub(crate) fn half_to_f32(h: u16) -> f32 {
     let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as u32, (h & 0x3ff) as u32);
     let mag = match e {
         0 => m as f32 / 16_777_216.0, // subnormal: m * 2^-24

@@ -13,6 +13,8 @@ pub struct Resolver {
     pub script: HashMap<u64, String>,
     /// package id -> container file path ("Palia/Content/Maps/Foo.umap")
     pub packages: HashMap<u64, String>,
+    /// anim::find_skeletal_mesh results: target package (lowercase) -> SkeletalMesh container path
+    pub skeletal_users: std::sync::Mutex<HashMap<String, Option<String>>>,
 }
 
 const KIND_SHIFT: u32 = 62;
@@ -20,23 +22,31 @@ const INDEX_MASK: u64 = (1 << KIND_SHIFT) - 1;
 
 impl Resolver {
     /// `global_utoc` = path to global.utoc; `game` = the opened game container's toc (for package ids).
+    /// Legacy .pak games have no global.utoc (their packages name imports directly): script map stays empty.
     pub fn load(global_utoc: &Path, game: &Toc) -> Res<Resolver> {
-        let toc = crate::parse_toc(&std::fs::read(global_utoc)?)?;
-        let entry = toc.ids.iter().position(|&(_, t)| t == 5).ok_or("no ScriptObjects chunk")?;
-        let mut ucas = std::fs::File::open(global_utoc.with_extension("ucas"))?;
-        let script = parse_script_objects(&crate::read_chunk(&toc, &mut ucas, entry as u32, u64::MAX)?)?;
+        let script = if game.pak.is_some() && !global_utoc.exists() {
+            HashMap::new()
+        } else {
+            let toc = crate::parse_toc(&std::fs::read(global_utoc)?)?;
+            let entry = toc.ids.iter().position(|&(_, t)| t == 5).ok_or("no ScriptObjects chunk")?;
+            let mut ucas = std::fs::File::open(global_utoc.with_extension("ucas"))?;
+            parse_script_objects(&crate::read_chunk(&toc, &mut ucas, entry as u32, u64::MAX)?)?
+        };
         let packages = game
             .files
             .iter()
             .filter(|(p, _)| p.ends_with(".uasset") || p.ends_with(".umap"))
             .filter_map(|(p, _)| Some((package_id(&container_path_to_package(p)?), p.clone())))
             .collect();
-        Ok(Resolver { script, packages })
+        Ok(Resolver { script, packages, skeletal_users: Default::default() })
     }
 
     /// Full object path for an import/class index, e.g. "/Script/Engine.Texture2D".
     /// For Export indices, resolves within `pkg`. PackageImports -> "<package>.<export hash hex>".
     pub fn object_path(&self, idx: ObjIndex, pkg: &ZenPackage) -> Option<String> {
+        if !pkg.import_paths.is_empty() && matches!(idx >> KIND_SHIFT, 1 | 2) {
+            return pkg.import_paths.get((idx & 0xFFFF_FFFF) as usize).cloned(); // legacy package
+        }
         match idx >> KIND_SHIFT {
             0 => {
                 let mut parts = vec![];

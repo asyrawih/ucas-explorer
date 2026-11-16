@@ -5,7 +5,7 @@
 // index could be picked up; every hit is filtered by "referenced package is a Material/Texture2D".
 use crate::global::{self, Resolver};
 use crate::zen::ZenPackage;
-use crate::{mesh, texture, Res};
+use crate::{mesh, props, texture, Res};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +164,76 @@ fn slots(ctx: &mut Ctx, pkg: &ZenPackage, export: usize, end: usize, need: usize
     (slots, resolved)
 }
 
+/// A material's base color stands in for a missing diffuse texture as this pseudo texture path
+/// ("#color/RRGGBB", sRGB); texture_png renders it as a solid image, so every consumer handles it.
+const COLOR: &str = "#color/";
+
+fn get<'a>(fields: &'a [(String, props::Value)], name: &str) -> Option<&'a props::Value> {
+    fields.iter().find(|f| f.0 == name).map(|f| &f.1)
+}
+
+/// Base color of a material from its vector parameters (tagged/legacy packages only: unversioned ones
+/// need mappings), walking up the Parent chain. Names like BaseColor/Diffuse/Albedo/Color/Tint win;
+/// else the first vector parameter that isn't emissive-like.
+// ponytail: parameter-name heuristic; base Materials' expression defaults (CachedExpressionData) are not read
+fn material_color(ctx: &mut Ctx, material: &str, depth: u32) -> Option<[f32; 3]> {
+    let (kind, i) = ctx.kind(material);
+    if depth > 6 || !matches!(kind, Kind::Material | Kind::Instance) {
+        return None;
+    }
+    let res = ctx.res;
+    let p = ctx.pkg(material)?;
+    if p.flags & 0x2000 != 0 {
+        return None;
+    }
+    let (fields, _) = props::read_properties(p, i, &res.class_name(p, i), &props::Mappings::default(), res).ok()?;
+    let mut vecs: Vec<(String, [f32; 3])> = vec![];
+    if let Some(props::Value::Array(a)) = get(&fields, "VectorParameterValues") {
+        for v in a {
+            let props::Value::Struct(_, f) = v else { continue };
+            let name = match get(f, "ParameterInfo") {
+                Some(props::Value::Struct(_, pi)) => match get(pi, "Name") {
+                    Some(props::Value::Name(n)) => n.to_lowercase(),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let Some(props::Value::Struct(_, c)) = get(f, "ParameterValue") else { continue };
+            let ch = |k: &str| match get(c, k) {
+                Some(props::Value::Float(x)) => Some(*x as f32),
+                _ => None,
+            };
+            if let (Some(r), Some(g), Some(b)) = (ch("R"), ch("G"), ch("B")) {
+                vecs.push((name, [r, g, b]));
+            }
+        }
+    }
+    let skip = ["emissive", "emission", "glow", "fresnel", "rim", "edge", "light", "fog", "outline", "specular"];
+    let usable = |n: &str| !skip.iter().any(|k| n.contains(k));
+    let pick = ["basecolor", "base color", "diffuse", "albedo", "color", "tint"]
+        .iter()
+        .find_map(|k| vecs.iter().find(|(n, _)| n.contains(k) && usable(n)))
+        .or_else(|| vecs.iter().find(|(n, _)| usable(n)));
+    if let Some((_, c)) = pick {
+        return Some(*c);
+    }
+    let parent = match get(&fields, "Parent") {
+        Some(props::Value::Object(o)) if o != "None" => o.split(['.', ':']).next().unwrap_or(o).to_string(),
+        _ => return None,
+    };
+    material_color(ctx, &parent, depth + 1)
+}
+
+/// Linear color -> "#color/RRGGBB" (sRGB).
+fn color_path(c: [f32; 3]) -> String {
+    let s = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        let v = if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        (v * 255.0 + 0.5) as u8
+    };
+    format!("{COLOR}{:02x}{:02x}{:02x}", s(c[0]), s(c[1]), s(c[2]))
+}
+
 /// Diffuse/normal texture choice for one material.
 fn slot(ctx: &mut Ctx, material: String) -> Slot {
     let mut tex = material_textures(ctx, &material, 0);
@@ -173,7 +243,8 @@ fn slot(ctx: &mut Ctx, material: String) -> Slot {
     let pick = |r: Role| tex.iter().find(|t| role("", &t.1).as_ref() == Some(&r))
         .or_else(|| tex.iter().find(|t| role(&t.0, &t.1).as_ref() == Some(&r)))
         .map(|t| t.1.clone());
-    Slot { diffuse: pick(Role::Diffuse), normal: pick(Role::Normal), material }
+    let diffuse = pick(Role::Diffuse).or_else(|| material_color(ctx, &material, 0).map(color_path));
+    Slot { diffuse, normal: pick(Role::Normal), material }
 }
 
 /// (material package, diffuse texture package) per material slot of a mesh export; `end` = where
@@ -294,7 +365,16 @@ pub fn material_preview(res: &Resolver, material: &str, load: &mut dyn FnMut(&st
         };
         (placeholder, rank)
     });
-    tex.into_iter()
+    let has_diffuse = tex.iter().any(|t| role(&t.0, &t.1) == Some(Role::Diffuse));
+    let color = if has_diffuse { None } else { material_color(&mut ctx, material, 0) };
+    let mut out: Vec<MatTexture> = color
+        .map(|c| {
+            let texture = color_path(c);
+            MatTexture { param: "base color".into(), png: texture_png(&mut ctx, &texture), role: "diffuse", texture }
+        })
+        .into_iter()
+        .collect();
+    out.extend(tex.into_iter()
         .map(|(param, texture)| MatTexture {
             role: match role(&param, &texture) {
                 Some(Role::Diffuse) => "diffuse",
@@ -304,8 +384,8 @@ pub fn material_preview(res: &Resolver, material: &str, load: &mut dyn FnMut(&st
             png: texture_png(&mut ctx, &texture),
             param,
             texture,
-        })
-        .collect()
+        }));
+    out
 }
 
 /// Exports material package `material` into `out_dir`: every texture as PNG, `<name>.mtl` (diffuse +
@@ -365,16 +445,23 @@ pub fn slot_diffuse_pngs(
 
 /// Decodes a Texture2D package to PNG bytes.
 fn texture_png(ctx: &mut Ctx, texture: &str) -> Option<Vec<u8>> {
+    if let Some(hex) = texture.strip_prefix(COLOR) {
+        let c = u32::from_str_radix(hex, 16).ok()?.to_be_bytes();
+        return texture::to_png(&texture::Image { width: 4, height: 4, rgba: [c[1], c[2], c[3], 255].repeat(16) }).ok();
+    }
     let (_, i) = ctx.kind(texture);
     let ubulk = ctx.container_path(texture, "ubulk").and_then(|c| (ctx.load)(&c));
-    let img = texture::decode_texture2d(ctx.pkg(texture)?.export_data(i), None, ubulk.as_deref()).ok()?;
+    let img = texture::decode_texture(ctx.pkg(texture)?, i, ubulk.as_deref()).ok()?;
     texture::to_png(&img).ok()
 }
 
 /// Decodes a Texture2D package to `<out_dir>/<name>.png`; returns the file name.
 fn write_texture(ctx: &mut Ctx, texture: &str, out_dir: &Path) -> Option<String> {
     let png = texture_png(ctx, texture)?;
-    let file = format!("{}.png", sanitize(texture.rsplit('/').next()?));
+    let file = match texture.strip_prefix(COLOR) {
+        Some(hex) => format!("color_{hex}.png"),
+        None => format!("{}.png", sanitize(texture.rsplit('/').next()?)),
+    };
     std::fs::write(out_dir.join(&file), png).ok()?;
     Some(file)
 }

@@ -1,4 +1,4 @@
-//! Minimal Unreal archive explorer: IoStore (.utoc/.ucas) and legacy .pak (via repak).
+//! Minimal game archive explorer: Unreal IoStore (.utoc/.ucas), legacy .pak (via repak), Unity .assets.
 //! Format reference: UE FIoStoreTocHeader / CUE4Parse IoStoreReader.
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 mod anim;
 mod bp;
 mod global;
+mod legacy;
 mod gui;
 mod mesh;
 mod material;
@@ -14,6 +15,8 @@ mod skeletal;
 mod preview;
 mod props;
 mod texture;
+mod unity;
+mod viewport;
 mod zen;
 
 /// Game archive for the `#[ignore]` data tests: `UCAS_TEST_UTOC=/path/to/pakchunk0.utoc cargo test -- --ignored`.
@@ -72,6 +75,7 @@ struct Toc {
     methods: Vec<String>,
     files: Vec<(String, u32)>, // (path, toc entry index)
     pak: Option<repak::PakReader>, // legacy .pak: entry index = position in `files`, read via repak
+    unity: Option<unity::Archive>, // Unity SerializedFile: entry index = object index, read converted
 }
 
 impl Toc {
@@ -84,24 +88,31 @@ impl Toc {
 fn is_pak(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pak"))
 }
-/// File holding the index: .pak itself, else the .utoc (a .ucas has no index).
-fn index_path(p: &Path) -> PathBuf {
-    if is_pak(p) { p.into() } else { p.with_extension("utoc") }
+fn has_ext(p: &Path, ext: &str) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
-/// File holding the data: .pak itself, else the .ucas.
+/// File holding the index: the .utoc for a .ucas, else the file itself (.utoc, .pak, Unity .assets).
+fn index_path(p: &Path) -> PathBuf {
+    if has_ext(p, "ucas") { p.with_extension("utoc") } else { p.into() }
+}
+/// File holding the data: the .ucas for a .utoc, else the file itself.
 fn data_path(p: &Path) -> PathBuf {
-    if is_pak(p) { p.into() } else { p.with_extension("ucas") }
+    if has_ext(p, "utoc") { p.with_extension("ucas") } else { p.into() }
 }
 
 fn open_archive(p: &Path) -> Res<Toc> {
-    if !is_pak(p) {
+    if has_ext(p, "utoc") {
         return parse_toc(&std::fs::read(p)?);
+    }
+    if !is_pak(p) && unity::sniff(p) {
+        let (u, files) = unity::Archive::open(p)?;
+        return Ok(Toc { block_size: 1, ids: vec![], chunks: vec![], blocks: vec![], methods: vec![], files, pak: None, unity: Some(u) });
     }
     let pak = repak::PakBuilder::new().reader(&mut io::BufReader::new(File::open(p)?))?;
     let mut names = pak.files();
     names.sort();
     let files = names.into_iter().enumerate().map(|(i, n)| (n, i as u32)).collect();
-    Ok(Toc { block_size: 1, ids: vec![], chunks: vec![], blocks: vec![], methods: vec![], files, pak: Some(pak) })
+    Ok(Toc { block_size: 1, ids: vec![], chunks: vec![], blocks: vec![], methods: vec![], files, pak: Some(pak), unity: None })
 }
 
 const FLAG_ENCRYPTED: u8 = 0x2;
@@ -177,7 +188,7 @@ fn parse_toc(buf: &[u8]) -> Res<Toc> {
     if flags & FLAG_INDEXED != 0 && dir_index_size > 0 {
         parse_dir_index(c.take(dir_index_size)?, &mut files)?;
     }
-    Ok(Toc { block_size, ids, chunks, blocks, methods, files, pak: None })
+    Ok(Toc { block_size, ids, chunks, blocks, methods, files, pak: None, unity: None })
 }
 
 fn parse_dir_index(buf: &[u8], out: &mut Vec<(String, u32)>) -> Res<()> {
@@ -219,8 +230,28 @@ fn parse_dir_index(buf: &[u8], out: &mut Vec<(String, u32)>) -> Res<()> {
     Ok(())
 }
 
-/// Reads up to `limit` bytes of a chunk (u64::MAX = whole chunk).
+/// Reads up to `limit` bytes of a chunk (u64::MAX = whole chunk). A whole legacy .pak .uasset/.umap
+/// comes back with its .uexp appended, the layout legacy::parse expects.
 fn read_chunk(toc: &Toc, ucas: &mut File, entry: u32, limit: u64) -> Res<Vec<u8>> {
+    let mut data = read_entry(toc, ucas, entry, limit)?;
+    if toc.pak.is_some() && limit == u64::MAX && legacy::is_legacy(&data) {
+        let path = &toc.files.get(entry as usize).ok_or("bad pak entry")?.0;
+        let uexp = format!("{}.uexp", path.rsplit_once('.').map_or(path.as_str(), |(s, _)| s));
+        if let Ok(k) = toc.files.binary_search_by(|(p, _)| p.as_str().cmp(&uexp)) {
+            data.extend(read_entry(toc, ucas, toc.files[k].1, u64::MAX)?);
+        }
+        legacy::append_path(&mut data, path);
+    }
+    Ok(data)
+}
+
+/// The entry's bytes as stored (Unity: converted).
+fn read_entry(toc: &Toc, ucas: &mut File, entry: u32, limit: u64) -> Res<Vec<u8>> {
+    if let Some(u) = &toc.unity {
+        let mut data = u.export(entry)?; // converted (PNG/OBJ/WAV/...), see unity.rs
+        data.truncate(limit.min(data.len() as u64) as usize);
+        return Ok(data);
+    }
     if let Some(pak) = &toc.pak {
         let (path, _) = toc.files.get(entry as usize).ok_or("bad pak entry")?;
         let mut data = pak.get(path, ucas)?; // ponytail: reads whole entry even for previews; pak files are small
@@ -260,7 +291,7 @@ fn extract_one(toc: &Toc, ucas: &mut File, out_dir: &Path, path: &str, entry: u3
         return Err("unsafe path".into());
     }
     let dst = out_dir.join(path);
-    let data = read_chunk(toc, ucas, entry, u64::MAX)?;
+    let data = read_entry(toc, ucas, entry, u64::MAX)?;
     std::fs::create_dir_all(dst.parent().ok_or("no parent")?)?;
     Ok(std::fs::write(&dst, data)?)
 }
@@ -299,7 +330,7 @@ fn export_converted(toc: &Toc, res: &global::Resolver, ucas: &mut File, out_dir:
                 material::export_obj_with_materials(res, &pkg, i, ubulk.as_deref(), &mut load, &dir)?;
                 continue;
             }
-            _ => (texture::to_png(&texture::decode_texture2d(pkg.export_data(i), None, ubulk.as_deref())?)?, "png"),
+            _ => (texture::to_png(&texture::decode_texture(&pkg, i, ubulk.as_deref())?)?, "png"),
         };
         let name = if hits.len() == 1 { format!("{stem}.{ext}") } else { format!("{stem}_{}.{ext}", pkg.exports[i].name) };
         let dst = out_dir.join(name);
@@ -314,7 +345,7 @@ fn main() -> Res<()> {
     if args.len() <= 2 {
         return gui::run(args.get(1).cloned());
     }
-    let usage = "usage (<archive> = .utoc, .ucas or .pak):\n  ucas-explorer [archive]              (GUI)\n  ucas-explorer <archive> list [filter]\n  ucas-explorer <archive> extract <filter> <out_dir>\n  ucas-explorer <archive> png <filter> <out_dir>      (Texture2D -> PNG)\n  ucas-explorer <archive> obj <filter> <out_dir>      (StaticMesh LOD0 -> OBJ+MTL+PNG)\n  ucas-explorer <archive> glb <filter> <out_dir>      (SkeletalMesh -> rigged, textured .glb)\n  ucas-explorer <archive> mat <filter> <out_dir>      (Material/MI -> PNG textures + .mtl + parameter list)\n  ucas-explorer <archive> anim <filter> <out_dir> [mesh_filter]  (AnimSequence -> .glb with skeleton, mesh, animation)\n  ucas-explorer <archive> props <filter> <out_dir> [usmap]  (properties of every export -> <asset>.json; usmap auto-detected in <archive dir>/Mappings/)\n  ucas-explorer <archive> bp <filter> <out_dir>       (Blueprint actor -> assembled OBJ+MTL+PNG of its mesh components)";
+    let usage = "usage (<archive> = .utoc, .ucas, .pak or Unity .assets; for .assets only list/extract apply, extract converts):\n  ucas-explorer [archive]              (GUI)\n  ucas-explorer <archive> list [filter]\n  ucas-explorer <archive> extract <filter> <out_dir>\n  ucas-explorer <archive> png <filter> <out_dir>      (Texture2D -> PNG)\n  ucas-explorer <archive> obj <filter> <out_dir>      (StaticMesh LOD0 -> OBJ+MTL+PNG)\n  ucas-explorer <archive> glb <filter> <out_dir>      (SkeletalMesh -> rigged, textured .glb)\n  ucas-explorer <archive> mat <filter> <out_dir>      (Material/MI -> PNG textures + .mtl + parameter list)\n  ucas-explorer <archive> anim <filter> <out_dir> [mesh_filter]  (AnimSequence -> .glb with skeleton, mesh, animation)\n  ucas-explorer <archive> props <filter> <out_dir> [usmap]  (properties of every export -> <asset>.json; usmap auto-detected in <archive dir>/Mappings/, not needed for legacy .pak)\n  ucas-explorer <archive> bp <filter> <out_dir>       (Blueprint actor, map, AnimBlueprint/animation/Skeleton/PhysicsAsset -> assembled OBJ+MTL+PNG)";
     let (Some(utoc), Some(cmd)) = (args.get(1), args.get(2)) else {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -418,11 +449,13 @@ fn main() -> Res<()> {
                     }
                     None => PathBuf::from(p),
                 },
-                None => props::Mappings::find(Path::new(utoc), game.as_deref()).ok_or(
-                    "no .usmap found (<archive dir>/Mappings/, next to the archive, or ~/.ucas-explorer/mappings/<game>/); pass one once and it is remembered",
-                )?,
+                None => match props::Mappings::find(Path::new(utoc), game.as_deref()) {
+                    Some(p) => p,
+                    None if toc.pak.is_some() => PathBuf::new(), // legacy .pak: tagged properties, no mappings needed
+                    None => return Err("no .usmap found (<archive dir>/Mappings/, next to the archive, or ~/.ucas-explorer/mappings/<game>/); pass one once and it is remembered".into()),
+                },
             };
-            let maps = props::Mappings::load(&usmap)?;
+            let maps = if usmap.as_os_str().is_empty() { props::Mappings::default() } else { props::Mappings::load(&usmap)? };
             eprintln!("mappings: {} ({} structs, {} enums)", usmap.display(), maps.structs.len(), maps.enums.len());
             let mut ucas = File::open(data_path(Path::new(utoc)))?;
             let res = global::Resolver::load(&Path::new(utoc).with_file_name("global.utoc"), &toc)?;
@@ -450,25 +483,29 @@ fn main() -> Res<()> {
         "bp" => {
             let out_dir = PathBuf::from(args.get(4).ok_or(usage)?);
             let game = props::game_name(&toc.files);
-            let usmap = props::Mappings::find(Path::new(utoc), game.as_deref()).ok_or("bp needs a .usmap (see the props command)")?;
-            let maps = props::Mappings::load(&usmap)?;
+            let maps = match props::Mappings::find(Path::new(utoc), game.as_deref()) {
+                Some(usmap) => props::Mappings::load(&usmap)?,
+                None if toc.pak.is_some() => props::Mappings::default(), // legacy .pak: tagged properties
+                None => return Err("bp needs a .usmap (see the props command)".into()),
+            };
             let mut ucas = File::open(data_path(Path::new(utoc)))?;
             let res = global::Resolver::load(&Path::new(utoc).with_file_name("global.utoc"), &toc)?;
             let (mut ok, mut fail) = (0, 0);
-            for (p, e) in matches.filter(|(p, _)| p.ends_with(".uasset")) {
+            for (p, e) in matches.filter(|(p, _)| p.ends_with(".uasset") || p.ends_with(".umap")) {
                 let r = (|| -> Res<bool> {
                     if p.split('/').any(|s| s == ".." || s.is_empty()) {
                         return Err("unsafe path".into());
                     }
                     let pkg = zen::parse(read_chunk(&toc, &mut ucas, *e, u64::MAX)?)?;
-                    if !(0..pkg.exports.len()).any(|i| res.class_name(&pkg, i) == "BlueprintGeneratedClass") {
+                    // the package's 3D-able export: Blueprint class, map, animation asset / AnimBlueprint, Skeleton, PhysicsAsset
+                    let Some(i) = bp::main_3d_export(&res, &pkg) else {
                         return Ok(false);
-                    }
+                    };
                     let mut load = |q: &str| -> Option<Vec<u8>> {
                         let (_, e) = toc.files.iter().find(|(f, _)| f == q)?;
                         read_chunk(&toc, &mut ucas, *e, u64::MAX).ok()
                     };
-                    let asm = bp::assemble(&res, &maps, &pkg, &mut load)?;
+                    let asm = bp::assemble_any(&res, &maps, &pkg, i, &mut load)?;
                     eprint!("{p}: {} parts\n{}", asm.parts.len(), bp::summary(&asm));
                     let dir = out_dir.join(Path::new(p).parent().unwrap_or(Path::new("")));
                     let files = bp::export_obj(&res, &asm, &mut load, &dir)?;
@@ -484,7 +521,7 @@ fn main() -> Res<()> {
                     }
                 }
             }
-            eprintln!("Blueprints written {ok}, failed {fail}");
+            eprintln!("assemblies written {ok}, failed {fail}");
         }
         "anim" => {
             let out_dir = PathBuf::from(args.get(4).ok_or(usage)?);
