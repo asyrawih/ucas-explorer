@@ -1,0 +1,15 @@
+[package]
+name = "ucas-explorer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37.0"
+oozextract = "0.5.7"
+png = "0.18.1"
+repak = { git = "https://github.com/trumank/repak", rev = "355b5f62f51959c7cc6dd5a51708646ef483065d", version = "0.2.3", default-features = false, features = ["oodle"] }
+texture2ddecoder = "0.1.2"
+
+# repak's oodle_loader downloads a proprietary dylib at runtime; use the pure-Rust shim instead.
+[patch."https://github.com/trumank/repak"]
+oodle_loader = { path = "oodle_shim" }
